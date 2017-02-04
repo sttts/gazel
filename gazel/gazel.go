@@ -7,14 +7,13 @@ import (
 	"go/build"
 	"io/ioutil"
 	"os"
+	"path"
 	"path/filepath"
 	"reflect"
 	"regexp"
 	"runtime"
 	"sort"
 	"strings"
-
-	"go/path/filepath"
 
 	bzl "github.com/bazelbuild/buildifier/core"
 	"github.com/golang/glog"
@@ -181,6 +180,11 @@ func (v *Vendorer) resolve(ipath string) Label {
 			pkg: strings.TrimPrefix(ipath, v.cfg.GoPrefix+"/"),
 			tag: "go_default_library",
 		}
+	} else if v.isSourceDir(path.Join(vendorPath, ipath)) {
+		return Label{
+			pkg: path.Join(vendorPath, ipath),
+			tag: "go_default_library",
+		}
 	}
 	return Label{
 		pkg: "vendor",
@@ -188,41 +192,99 @@ func (v *Vendorer) resolve(ipath string) Label {
 	}
 }
 
-func (v *Vendorer) walk(root string, f func(path, ipath string, pkg *build.Package) error) error {
-	skipVendor := true
-	if root == vendorPath {
-		skipVendor = false
-	}
-	return sfilepath.Walk(root, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		if !info.IsDir() {
-			return nil
-		}
-		if skipVendor && strings.HasPrefix(path, vendorPath) {
-			return filepath.SkipDir
-		}
-		for _, r := range v.skippedPaths {
-			if r.Match([]byte(path)) {
-				return filepath.SkipDir
-			}
-		}
+func (v *Vendorer) walk(root string, fn func(path, ipath string, pkg *build.Package) error) error {
+	glog.Infof("Walking %v", root)
+
+	process := func(path string) error {
 		ipath, err := filepath.Rel(root, path)
+		glog.Infof("ipath=%q root=%q v.root=%q path=%q", ipath, root, v.root, path)
 		if err != nil {
 			return err
 		}
 		pkg, err := v.importPkg(".", filepath.Join(v.root, path))
 		if err != nil {
 			if _, ok := err.(*build.NoGoError); err != nil && ok {
-				return nil
-			} else {
-				return err
+				return nil // ignore
 			}
+			return fmt.Errorf("failed to import package at %q: %v", path, err)
 		}
 
-		return f(path, ipath, pkg)
-	})
+		err = fn(path, ipath, pkg)
+		if err != nil {
+			return fmt.Errorf("failed to process directory %q: %v", path, err)
+		}
+
+		return nil
+	}
+
+	process(root)
+
+	dirs := []string{root}
+	seen := map[string]bool{}
+nextQueuedDir:
+	for {
+		if len(dirs) == 0 {
+			break
+		}
+
+		dir := dirs[0]
+		dirs = dirs[1:]
+
+		// avoid visiting dirs twice
+		resolved, err := filepath.EvalSymlinks(dir)
+		if err != nil {
+			return err
+		}
+		if seen[resolved] {
+			continue nextQueuedDir
+		}
+		seen[resolved] = true
+
+		f, err := os.Open(dir)
+		if err != nil {
+			return err
+		}
+		infos, err := f.Readdir(0)
+		if err != nil {
+			return err
+		}
+	nextFileInDirectory:
+		for _, info := range infos {
+			path := filepath.Join(dir, info.Name())
+			glog.Infof(path)
+
+			// follow symlinks
+			if info.Mode()&os.ModeSymlink != 0 {
+				info, err = os.Stat(path)
+				if err != nil {
+					return fmt.Errorf("failed to stat symlinked file %q: %v", resolved, err)
+				}
+			}
+
+			if !info.IsDir() {
+				continue nextFileInDirectory
+			}
+			if info.Name() == "vendor" {
+				glog.Infof("Skipping vendor dir")
+				continue nextFileInDirectory
+			}
+			for _, r := range v.skippedPaths {
+				if r.Match([]byte(path)) {
+					continue nextFileInDirectory
+				}
+			}
+
+			err := process(path)
+			if err != nil {
+				return err
+			}
+
+			// recurse into directory later
+			dirs = append(dirs, path)
+		}
+	}
+
+	return nil
 }
 
 func (v *Vendorer) walkRepo() error {
@@ -374,9 +436,22 @@ func (v *Vendorer) addRules(pkgPath string, rules []*bzl.Rule) {
 	v.newRules[cleanPath] = append(v.newRules[cleanPath], rules...)
 }
 
+func (v *Vendorer) isSourceDir(dir string) bool {
+	for _, root := range v.cfg.SrcDirs {
+		if filepath.HasPrefix(dir, filepath.Clean(root)) {
+			return true
+		}
+	}
+	return false
+}
+
 func (v *Vendorer) walkVendor() error {
 	var rules []*bzl.Rule
 	if err := v.walk(vendorPath, func(path, ipath string, pkg *build.Package) error {
+		if v.isSourceDir(path) {
+			return nil
+		}
+
 		srcNameMap := func(srcs ...[]string) *bzl.ListExpr {
 			return asExpr(
 				apply(
